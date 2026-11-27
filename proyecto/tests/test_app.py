@@ -61,6 +61,35 @@ def test_login_incorrecto(client):
     assert r.status_code == 401
 
 
+def test_hello_escapa_html(client):
+    r = client.get("/hello", query_string={"name": "<script>alert('xss')</script>"})
+    assert r.status_code == 200
+    assert "<script>" not in r.get_data(as_text=True)
+    assert "&lt;script&gt;" in r.get_data(as_text=True)
+
+
+def test_busqueda_no_interpreta_sql(client):
+    r = client.get("/alumnos/buscar", query_string={"nombre": "zzz' UNION SELECT 0, name, sql, 0 FROM sqlite_master --"})
+    assert r.status_code == 200
+    assert r.get_json() == []
+
+
+def test_login_rechaza_csrf_invalido(client):
+    r = client.post("/login", data={"usuario": "admin", "clave": "admin", "csrf_token": "invalido"})
+    assert r.status_code == 403
+
+
+def test_login_correcto(client):
+    token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/").get_data(as_text=True))
+    assert token
+    r = client.post(
+        "/login",
+        data={"usuario": "admin", "clave": "admin", "csrf_token": token.group(1)},
+    )
+    assert r.status_code == 200
+    assert r.get_json()["mensaje"] == "Bienvenido, administrador"
+
+
 def test_metricas(client):
     client.get("/alumnos")
     r = client.get("/metrics")

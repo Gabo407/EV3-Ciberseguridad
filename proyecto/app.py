@@ -5,22 +5,30 @@
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
-import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import time
+from collections import defaultdict
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, g, jsonify, render_template_string, request, session
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 
 ## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
+SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+ADMIN_CLAVE = os.environ.get("ADMIN_CLAVE", "admin")
+ADMIN_CLAVE_HASH = generate_password_hash(ADMIN_CLAVE)
 app.config["SECRET_KEY"] = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "").lower() == "true",
+)
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
@@ -50,6 +58,10 @@ PATRONES_ATAQUE = {
     "path_traversal": re.compile(r"\.\./|\.\.\\|%2e%2e", re.I),
 }
 
+INTENTOS_LOGIN = defaultdict(list)
+INTENTOS_LOGIN_MAX = 5
+INTENTOS_LOGIN_VENTANA = 60
+
 PORTADA = """<!doctype html>
 <html lang="es">
 <head><meta charset="utf-8"><title>Sistema Alumnos</title></head>
@@ -67,6 +79,7 @@ PORTADA = """<!doctype html>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
+  <input name="csrf_token" value="{{ csrf_token }}" type="hidden">
   <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
@@ -114,6 +127,12 @@ def antes_de_la_peticion():
     @brief Marca el inicio de la petición y cuenta los parámetros con patrones de ataque.
     """
     g.inicio = time.perf_counter()
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    if request.method == "POST" and request.path == "/login":
+        token = request.form.get("csrf_token", "")
+        if not secrets.compare_digest(token, session["csrf_token"]):
+            return jsonify({"error": "Token CSRF inválido"}), 403
     valores = list(request.args.values()) + list(request.form.values())
     for tipo, patron in PATRONES_ATAQUE.items():
         if any(patron.search(v) for v in valores):
@@ -132,6 +151,10 @@ def despues_de_la_peticion(respuesta):
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
         HTTP_LATENCIA.labels(endpoint).observe(time.perf_counter() - g.get("inicio", time.perf_counter()))
+    respuesta.headers.setdefault("X-Content-Type-Options", "nosniff")
+    respuesta.headers.setdefault("X-Frame-Options", "DENY")
+    respuesta.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    respuesta.headers.setdefault("Content-Security-Policy", "default-src 'self'; form-action 'self'; frame-ancestors 'none'")
     return respuesta
 
 
@@ -141,7 +164,7 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    return render_template_string(PORTADA, version=VERSION, csrf_token=session["csrf_token"])
 
 
 @app.route("/hello")
@@ -151,7 +174,7 @@ def hello():
     @return Página HTML con el saludo.
     """
     name = request.args.get("name", "visitante")
-    return f"<h1>Hola, {name}!</h1>"
+    return render_template_string("<h1>Hola, {{ name }}!</h1>", name=name)
 
 
 @app.route("/health")
@@ -202,11 +225,16 @@ def buscar_alumnos():
     @return JSON con los alumnos encontrados.
     """
     nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
+    nombre_escapado = nombre.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    patron = f"%{nombre_escapado}%"
     try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+        filas = conectar().execute(
+            "SELECT * FROM alumnos WHERE nombre LIKE ? ESCAPE '\\'",
+            (patron,),
+        ).fetchall()
+    except sqlite3.Error:
+        app.logger.exception("Error al consultar alumnos")
+        return jsonify({"error": "No se pudo realizar la consulta"}), 500
     return jsonify([dict(f) for f in filas])
 
 
@@ -218,9 +246,18 @@ def login():
     """
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    ahora = time.monotonic()
+    cliente = request.remote_addr or "desconocido"
+    intentos = INTENTOS_LOGIN[cliente]
+    intentos[:] = [marca for marca in intentos if ahora - marca < INTENTOS_LOGIN_VENTANA]
+    if len(intentos) >= INTENTOS_LOGIN_MAX:
+        app.logger.warning("Acceso limitado para el usuario '%s' desde %s", usuario, cliente)
+        return jsonify({"error": "Demasiados intentos"}), 429
+    if usuario == ADMIN_USUARIO and check_password_hash(ADMIN_CLAVE_HASH, clave):
+        intentos.clear()
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
+    intentos.append(ahora)
     LOGIN_FALLIDOS.inc()
     app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
     return jsonify({"error": "Credenciales inválidas"}), 401
@@ -238,4 +275,8 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
+        debug=os.environ.get("FLASK_DEBUG", "").lower() == "true",
+    )
